@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -18,6 +19,8 @@
 #include <ApplicationServices/ApplicationServices.h>
 #include <Carbon/Carbon.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/hidsystem/IOHIDLib.h>
+#include <IOKit/hidsystem/IOHIDParameter.h>
 #include <IOKit/hidsystem/IOLLEvent.h>
 
 // local includes
@@ -365,6 +368,33 @@ namespace lvh::detail {
     }
 
     /**
+     * @brief Open a connection to the IOHIDSystem for Caps Lock lock-state control.
+     *
+     * CGEventPost cannot change the real Caps Lock lock state on macOS: plain key
+     * events, `kCGEventFlagsChanged` with `kCGEventFlagMaskAlphaShift`, and posting
+     * through a session or HID event tap all leave the hardware lock unchanged.
+     * Only `IOHIDSetModifierLockState` actually flips it, the same call
+     * Hammerspoon's `hs.hid.capslock` uses.
+     *
+     * @return An open IOHIDSystem connection, or `IO_OBJECT_NULL` when unavailable.
+     */
+    inline io_connect_t open_hid_system_connection() {
+      const auto service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching(kIOHIDSystemClass));
+      if (!service) {
+        return IO_OBJECT_NULL;
+      }
+
+      io_connect_t connection = IO_OBJECT_NULL;
+      const auto result = IOServiceOpen(service, mach_task_self(), kIOHIDParamConnectType, &connection);
+      IOObjectRelease(service);
+      if (result != KERN_SUCCESS) {
+        return IO_OBJECT_NULL;
+      }
+
+      return connection;
+    }
+
+    /**
      * @brief Convert a scroll-wheel slider value to logical lines per detent.
      *
      * @param scale macOS scroll-wheel scaling preference.
@@ -463,13 +493,41 @@ namespace lvh::detail {
      */
     class MacosInputState {
     public:
+      /**
+       * @brief Reads the current Caps Lock lock state.
+       *
+       * @return The lock state, or `std::nullopt` when it could not be read.
+       */
+      using CapsLockStateGetter = std::function<std::optional<bool>()>;
+
+      /**
+       * @brief Sets the Caps Lock lock state.
+       *
+       * @return `true` when the state was applied.
+       */
+      using CapsLockStateSetter = std::function<bool(bool)>;
+
       MacosInputState():
           display {CGMainDisplayID()},
           display_scaling {display_scaling_for(display)},
           source {CGEventSourceCreate(kCGEventSourceStateHIDSystemState)},
           keyboard_source {CGEventSourceCreate(kCGEventSourceStatePrivate)},
           mouse_event {source ? CGEventCreate(source) : nullptr},
-          scroll_lines_per_detent_value {read_scroll_lines_per_detent(scrollwheel_scaling)} {}
+          scroll_lines_per_detent_value {read_scroll_lines_per_detent(scrollwheel_scaling)},
+          hid_connection {open_hid_system_connection()} {
+        if (hid_connection != IO_OBJECT_NULL) {
+          caps_lock_state_getter = [this]() -> std::optional<bool> {
+            bool state = false;
+            if (IOHIDGetModifierLockState(hid_connection, kIOHIDCapsLockState, &state) != KERN_SUCCESS) {
+              return std::nullopt;
+            }
+            return state;
+          };
+          caps_lock_state_setter = [this](bool new_state) {
+            return IOHIDSetModifierLockState(hid_connection, kIOHIDCapsLockState, new_state) == KERN_SUCCESS;
+          };
+        }
+      }
 
       MacosInputState(const MacosInputState &) = delete;
       MacosInputState &operator=(const MacosInputState &) = delete;
@@ -485,6 +543,9 @@ namespace lvh::detail {
         }
         if (source) {
           CFRelease(source);
+        }
+        if (hid_connection != IO_OBJECT_NULL) {
+          IOServiceClose(hid_connection);
         }
       }
 
@@ -518,9 +579,53 @@ namespace lvh::detail {
       CGEventRef mouse_event {};  ///< Reusable CoreGraphics mouse event.
       double scrollwheel_scaling = default_scrollwheel_scaling;  ///< Raw macOS scroll-wheel scaling preference.
       int scroll_lines_per_detent_value = default_scroll_lines_per_detent;  ///< Logical lines per wheel detent.
+      io_connect_t hid_connection {IO_OBJECT_NULL};  ///< IOHIDSystem connection used to read and set the Caps Lock lock state.
       CGEventFlags keyboard_flags {};  ///< Active modifier flags applied to mouse events.
       std::mutex keyboard_mutex;  ///< Guards shared keyboard modifier state.
+      CapsLockStateGetter caps_lock_state_getter;  ///< Reads the Caps Lock lock state. Overridable in tests.
+      CapsLockStateSetter caps_lock_state_setter;  ///< Sets the Caps Lock lock state. Overridable in tests.
+      bool caps_lock_held = false;  ///< Whether a Caps Lock press is currently held, guarded by `keyboard_mutex`.
     };
+
+    /**
+     * @brief Toggle the macOS Caps Lock state through IOHID on a key press transition.
+     *
+     * The Moonlight protocol carries no lock bit, so Caps Lock arrives as an
+     * ordinary key down and up. Toggling only on the press transition, tracked
+     * through `caps_lock_held`, avoids re-toggling on the repeat key-down events
+     * Sunshine sends while a key stays held.
+     *
+     * @param state Shared macOS backend state. The caller holds `keyboard_mutex`,
+     *   and `caps_lock_state_getter` and `caps_lock_state_setter` are both set.
+     * @param pressed Whether this is a Caps Lock press (`true`) or release (`false`).
+     */
+    inline void handle_caps_lock_transition(MacosInputState &state, bool pressed) {
+      if (!pressed) {
+        state.caps_lock_held = false;
+        return;
+      }
+
+      if (state.caps_lock_held) {
+        return;
+      }
+      state.caps_lock_held = true;
+
+      const auto current_state = state.caps_lock_state_getter();
+      if (!current_state) {
+        return;
+      }
+
+      const auto new_state = !*current_state;
+      if (!state.caps_lock_state_setter(new_state)) {
+        return;
+      }
+
+      if (new_state) {
+        state.keyboard_flags |= kCGEventFlagMaskAlphaShift;
+      } else {
+        state.keyboard_flags &= ~kCGEventFlagMaskAlphaShift;
+      }
+    }
 
     /**
      * @brief Build the CoreGraphics event for one key transition and update the shared modifier state.
@@ -541,7 +646,10 @@ namespace lvh::detail {
       CGEventSetIntegerValueField(keyboard_event, kCGKeyboardEventKeycode, key);
 
       ModifierFlags modifier_flags;
-      if (modifier_flags_for_key(key, modifier_flags)) {
+      if (key == kVK_CapsLock && state.caps_lock_state_getter && state.caps_lock_state_setter) {
+        handle_caps_lock_transition(state, pressed);
+        CGEventSetType(keyboard_event, kCGEventFlagsChanged);
+      } else if (modifier_flags_for_key(key, modifier_flags)) {
         if (pressed) {
           state.keyboard_flags |= modifier_flags.generic | modifier_flags.device;
         } else {

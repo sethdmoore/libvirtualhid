@@ -149,4 +149,30 @@ namespace lvh::detail::test {
    */
   MacosBackendUtilityResult macos_backend_utilities();
 
+  /**
+   * @brief Result of one step of a macOS Caps Lock key transition.
+   */
+  struct MacosCapsLockStepResult {
+    bool toggle_invoked = false;  ///< Whether the fake IOHID setter was invoked for this step.
+    bool fake_lock_state = false;  ///< Fake Caps Lock state after this step.
+    bool caps_lock_held = false;  ///< Whether `MacosInputState` considers Caps Lock held after this step.
+    bool alpha_shift_flag_set = false;  ///< Whether the shared keyboard flags carry `kCGEventFlagMaskAlphaShift`.
+    OperationStatus status;  ///< Status returned by the keyboard submit call for this step.
+  };
+
+  /**
+   * @brief Submit a scripted sequence of Caps Lock key transitions against a fake IOHID lock.
+   *
+   * Substitutes a fake lock-state getter and setter on `MacosInputState` so the
+   * sequence never touches the real Caps Lock hardware state.
+   *
+   * @param pressed_sequence Press (`true`) and release (`false`) steps to submit in order.
+   * @param initial_fake_lock_state Starting state of the fake IOHID lock.
+   * @return One result per step, in submitted order.
+   */
+  std::vector<MacosCapsLockStepResult> macos_backend_caps_lock_sequence(
+    const std::vector<bool> &pressed_sequence,
+    bool initial_fake_lock_state
+  );
+
 }  // namespace lvh::detail::test

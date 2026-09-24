@@ -157,4 +157,37 @@ namespace lvh::detail::test {
     return result;
   }
 
+  std::vector<MacosCapsLockStepResult> macos_backend_caps_lock_sequence(
+    const std::vector<bool> &pressed_sequence,
+    bool initial_fake_lock_state
+  ) {
+    auto state = std::make_shared<macos::MacosInputState>();
+
+    auto fake_lock_state = std::make_shared<bool>(initial_fake_lock_state);
+    auto setter_calls = std::make_shared<int>(0);
+    state->caps_lock_state_getter = [fake_lock_state]() -> std::optional<bool> {
+      return *fake_lock_state;
+    };
+    state->caps_lock_state_setter = [fake_lock_state, setter_calls](bool new_state) {
+      ++*setter_calls;
+      *fake_lock_state = new_state;
+      return true;
+    };
+
+    macos::MacosKeyboard keyboard {state};
+    std::vector<MacosCapsLockStepResult> results;
+    for (const auto pressed : pressed_sequence) {
+      const auto calls_before = *setter_calls;
+      MacosCapsLockStepResult step;
+      step.status = keyboard.submit({.key_code = 0x14 /* VKEY_CAPITAL */, .pressed = pressed});
+      step.toggle_invoked = *setter_calls != calls_before;
+      step.fake_lock_state = *fake_lock_state;
+      step.caps_lock_held = state->caps_lock_held;
+      step.alpha_shift_flag_set = (state->keyboard_flags & kCGEventFlagMaskAlphaShift) != 0;
+      results.push_back(step);
+    }
+
+    return results;
+  }
+
 }  // namespace lvh::detail::test

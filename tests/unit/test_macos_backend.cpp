@@ -242,3 +242,51 @@ TEST_F(MacosBackendTest, ReportsCapabilitiesAndUnsupportedDevices) {
   EXPECT_EQ(result.trackpad_status.code(), lvh::ErrorCode::unsupported_profile);
   EXPECT_EQ(result.pen_tablet_status.code(), lvh::ErrorCode::unsupported_profile);
 }
+
+TEST_F(MacosBackendTest, CapsLockPressTogglesLockOnceWhileHeld) {
+  const auto results = lvh::detail::test::macos_backend_caps_lock_sequence({true, true}, false);
+  ASSERT_EQ(results.size(), 2U);
+
+  EXPECT_TRUE(results[0].status.ok()) << results[0].status.message();
+  EXPECT_TRUE(results[0].toggle_invoked);
+  EXPECT_TRUE(results[0].fake_lock_state);
+  EXPECT_TRUE(results[0].caps_lock_held);
+  EXPECT_TRUE(results[0].alpha_shift_flag_set);
+
+  EXPECT_TRUE(results[1].status.ok()) << results[1].status.message();
+  EXPECT_FALSE(results[1].toggle_invoked) << "repeated press while held must not toggle again";
+  EXPECT_TRUE(results[1].fake_lock_state);
+  EXPECT_TRUE(results[1].caps_lock_held);
+  EXPECT_TRUE(results[1].alpha_shift_flag_set);
+}
+
+TEST_F(MacosBackendTest, CapsLockReleaseDoesNotToggleAndClearsHeld) {
+  const auto results = lvh::detail::test::macos_backend_caps_lock_sequence({true, false}, false);
+  ASSERT_EQ(results.size(), 2U);
+
+  EXPECT_TRUE(results[1].status.ok()) << results[1].status.message();
+  EXPECT_FALSE(results[1].toggle_invoked) << "release must not toggle the lock";
+  EXPECT_TRUE(results[1].fake_lock_state) << "lock stays on after release";
+  EXPECT_FALSE(results[1].caps_lock_held);
+  EXPECT_TRUE(results[1].alpha_shift_flag_set) << "AlphaShift stays set while the lock is on";
+}
+
+TEST_F(MacosBackendTest, CapsLockPressAfterReleaseTogglesAgain) {
+  const auto results = lvh::detail::test::macos_backend_caps_lock_sequence({true, false, true}, false);
+  ASSERT_EQ(results.size(), 3U);
+
+  EXPECT_TRUE(results[2].status.ok()) << results[2].status.message();
+  EXPECT_TRUE(results[2].toggle_invoked) << "press after release must toggle again";
+  EXPECT_FALSE(results[2].fake_lock_state);
+  EXPECT_TRUE(results[2].caps_lock_held);
+  EXPECT_FALSE(results[2].alpha_shift_flag_set) << "AlphaShift clears once the lock toggles off";
+}
+
+TEST_F(MacosBackendTest, CapsLockStartingLockedTogglesOffOnPress) {
+  const auto results = lvh::detail::test::macos_backend_caps_lock_sequence({true}, true);
+  ASSERT_EQ(results.size(), 1U);
+
+  EXPECT_TRUE(results[0].toggle_invoked);
+  EXPECT_FALSE(results[0].fake_lock_state);
+  EXPECT_FALSE(results[0].alpha_shift_flag_set);
+}
